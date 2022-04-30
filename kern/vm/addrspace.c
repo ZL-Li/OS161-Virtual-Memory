@@ -37,6 +37,7 @@
 #include <addrspace.h>
 #include <vm.h>
 #include <proc.h>
+#include <elf.h>
 
 /*
  * Note! If OPT_DUMBVM is set, as is the case until you start the VM
@@ -62,6 +63,20 @@ as_create(void)
 	 * Initialize as needed.
 	 */
 
+    // initialize pagetable
+    as->pagetable = kmalloc(TOP_LEVEL_ENTRIES_NUM * sizeof(paddr_t *));
+    if (as->pagetable == NULL) {
+		return NULL;
+	}
+
+    int i;
+    for (i = 0; i < TOP_LEVEL_ENTRIES_NUM; i++) {
+        as->pagetable[i] = NULL;
+    }
+
+    // initialize rigion pointer and loading dirty bit
+    as->head = NULL;
+    as->loading_dirty_bit = 0;
 	return as;
 }
 
@@ -78,8 +93,59 @@ as_copy(struct addrspace *old, struct addrspace **ret)
 	/*
 	 * Write this.
 	 */
+    
+    // copy the page table
+    int i, j;
+    vaddr_t vaddr;
+    paddr_t old_paddr;
+    paddr_t paddr;
+    int dirty_bit;
 
-	(void)old;
+    for (i = 0; i < TOP_LEVEL_ENTRIES_NUM; i++) {
+        if (old->pagetable[i] != NULL) {
+            newas->pagetable[i] = kmalloc(SECOND_LEVEL_ENTRIES_NUM * sizeof(paddr_t));
+            if (newas->pagetable[i] == NULL) {
+                return ENOMEM;
+            }
+            for (j = 0; j < SECOND_LEVEL_ENTRIES_NUM; j++){
+                // no mapping in this entry in old
+                if (old->pagetable[i][j] == 0) {
+                    newas->pagetable[i][j] = 0;
+                }
+                // exists a mapping in this entry in old
+                else {
+                    // allocate the frame
+                    vaddr = alloc_kpages(1);
+                    // zero fill
+                    bzero((void *) vaddr, PAGE_SIZE);
+                    // get the physical frame number
+                    paddr = KVADDR_TO_PADDR(vaddr);
+                    // copy the frame contents from old paddr to new paddr
+                    old_paddr = old->pagetable[i][j] & PAGE_FRAME;
+                    memcpy((void *) vaddr, (void *) PADDR_TO_KVADDR(old_paddr), PAGE_SIZE);
+                    // add paddr to the new page table
+                    dirty_bit = old->pagetable[i][j] & TLBLO_DIRTY;
+                    paddr = paddr | dirty_bit | TLBLO_VALID;
+                    newas->pagetable[i][j] = paddr;
+                }
+            }
+        }
+    }
+
+	// copy the region linked list
+	struct region *cur = old->head;
+    int error;
+
+	while (cur != NULL) {
+		error = as_define_region(newas, cur->vbase, cur->npages, cur->readable, cur->writeable, cur->executable);
+		if (error) {
+			return error;
+		}
+		cur = cur->next;
+	}
+
+    // copy the loading dirty bit
+	newas->loading_dirty_bit = old->loading_dirty_bit;
 
 	*ret = newas;
 	return 0;
@@ -91,6 +157,29 @@ as_destroy(struct addrspace *as)
 	/*
 	 * Clean up as needed.
 	 */
+    
+    // clean up the page table
+    int i, j;
+    for (i = 0; i < TOP_LEVEL_ENTRIES_NUM; i++) {
+        if (as->pagetable[i] != NULL) {
+            for (j = 0; j < SECOND_LEVEL_ENTRIES_NUM; j++) {
+                if (as->pagetable[i][j] != 0) {
+                    free_kpages(PADDR_TO_KVADDR(as->pagetable[i][j]));
+                }
+            }
+            kfree(as->pagetable[i]);
+        }
+    }
+    kfree(as->pagetable);
+    
+    // clean up the region
+    struct region *head = as->head;
+    struct region *cur = as->head;
+    while (cur != NULL) {
+        head = head->next;
+        kfree(cur);
+        cur = head;
+    }
 
 	kfree(as);
 }
@@ -112,6 +201,17 @@ as_activate(void)
 	/*
 	 * Write this.
 	 */
+
+	int i, spl;
+
+    /* Disable interrupts on this CPU while frobbing the TLB. */
+	spl = splhigh();
+
+	for (i=0; i<NUM_TLB; i++) {
+		tlb_write(TLBHI_INVALID(i), TLBLO_INVALID(), i);
+	}
+
+	splx(spl);
 }
 
 void
@@ -142,13 +242,30 @@ as_define_region(struct addrspace *as, vaddr_t vaddr, size_t memsize,
 	 * Write this.
 	 */
 
-	(void)as;
-	(void)vaddr;
-	(void)memsize;
-	(void)readable;
-	(void)writeable;
-	(void)executable;
-	return ENOSYS; /* Unimplemented */
+    // allocate mmemory for a new region
+    struct region * new_region = kmalloc(sizeof(struct region));
+    if (new_region == NULL) {
+        return ENOMEM;
+    }
+
+    // load to new_region
+    new_region->vbase = vaddr;
+    new_region->npages = memsize;
+    new_region->next = NULL;
+    new_region->readable = readable;
+    new_region->writeable = writeable;
+    new_region->executable = executable;
+
+    // load new_region to as
+    if (as->head == NULL) {
+        as->head = new_region;
+    }
+    else {
+        new_region->next = as->head;
+        as->head = new_region;
+    }
+
+	return 0;
 }
 
 int
@@ -158,7 +275,10 @@ as_prepare_load(struct addrspace *as)
 	 * Write this.
 	 */
 
-	(void)as;
+    // indicate it's in a load and make it writable temporarily
+	as->loading_dirty_bit = TLBLO_DIRTY;
+    // flush TLB
+    as_activate();
 	return 0;
 }
 
@@ -169,7 +289,11 @@ as_complete_load(struct addrspace *as)
 	 * Write this.
 	 */
 
-	(void)as;
+    // recover
+	as->loading_dirty_bit = 0;
+    // flush TLB
+    as_activate();
+
 	return 0;
 }
 
@@ -179,8 +303,17 @@ as_define_stack(struct addrspace *as, vaddr_t *stackptr)
 	/*
 	 * Write this.
 	 */
+    int error;
+    // USERSTACK: USERSPACETOP: MIPS_KSEG0 (the top of the user space)
+    // PAGE_SIZE: 4096
 
-	(void)as;
+    vaddr_t vaddr = USERSTACK - STACK_PAGES * PAGE_SIZE;
+    size_t memsize = STACK_PAGES * PAGE_SIZE;
+
+	error = as_define_region(as, vaddr, memsize, 0x4, 0x2, 0);
+    if (error) {
+        return error;
+    }
 
 	/* Initial user-level stack pointer */
 	*stackptr = USERSTACK;

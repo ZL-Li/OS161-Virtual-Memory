@@ -30,6 +30,11 @@
 #ifndef _ADDRSPACE_H_
 #define _ADDRSPACE_H_
 
+#define TOP_LEVEL_ENTRIES_NUM 2048
+#define SECOND_LEVEL_ENTRIES_NUM 512
+#define STACK_PAGES 16
+
+
 /*
  * Address space structure and operations.
  */
@@ -39,6 +44,16 @@
 #include "opt-dumbvm.h"
 
 struct vnode;
+
+
+struct region {
+    vaddr_t vbase;
+    size_t npages;
+    struct region *next;
+    int readable;
+    int writeable;
+    int executable;
+};
 
 
 /*
@@ -59,6 +74,13 @@ struct addrspace {
         paddr_t as_stackpbase;
 #else
         /* Put stuff here for your VM system */
+
+        paddr_t **pagetable;
+        // the head of a linked list of regions
+        struct region *head;
+        // use for as_prepare_load()
+        uint32_t loading_dirty_bit;
+
 #endif
 };
 
